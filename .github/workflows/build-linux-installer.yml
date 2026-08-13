@@ -47,7 +47,11 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Build Debian package only
-        run: npx tauri build --ci --config src-tauri/tauri.linux-installer.conf.json
+        # Keep the Linux fork package build on the checked-in CI overlay. The
+        # old linux-installer overlay was removed when the shared Tauri config
+        # was consolidated, so referencing it makes every release dispatch
+        # fail before compilation starts.
+        run: npx tauri build --ci --config src-tauri/tauri.ci.conf.json
 
       - name: Stage verified release files
         run: |
