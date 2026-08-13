@@ -3628,6 +3628,54 @@ fn codex_managed_store_launch_unsafe_error(direct_error: &str, powershell_error:
     )
 }
 
+#[cfg(target_os = "linux")]
+fn detect_codex_exec_path_by_linux_candidates() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Prefer the current official ChatGPT package. Its public entry point is a
+    // symlink to `codex-launcher`, which then execs the real `ChatGPT` binary.
+    // Legacy codex-desktop launchers remain as fallbacks for existing installs.
+    let mut candidates = vec![
+        std::path::PathBuf::from("/usr/bin/chatgpt"),
+        std::path::PathBuf::from("/usr/local/bin/chatgpt"),
+        std::path::PathBuf::from("/usr/lib/chatgpt/codex-launcher"),
+        std::path::PathBuf::from("/usr/lib/chatgpt/ChatGPT"),
+        std::path::PathBuf::from("/usr/bin/codex-desktop"),
+        std::path::PathBuf::from("/usr/local/bin/codex-desktop"),
+        std::path::PathBuf::from("/opt/codex-desktop/start.sh"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/chatgpt"));
+        candidates.push(home.join(".local/bin/codex-desktop"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            candidates.push(directory.join("chatgpt"));
+            candidates.push(directory.join("codex-desktop"));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        let key = candidate.to_string_lossy().to_string();
+        if !seen.insert(key) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            crate::modules::logger::log_info(&format!(
+                "[Path Detect] Linux ChatGPT/Codex launcher hit: {}",
+                candidate.to_string_lossy()
+            ));
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 pub(crate) fn detect_codex_exec_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -3650,6 +3698,13 @@ pub(crate) fn detect_codex_exec_path() -> Option<std::path::PathBuf> {
             return Some(path);
         }
         if let Some(path) = detect_codex_exec_path_by_appx_install_location() {
+            return Some(path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(path) = detect_codex_exec_path_by_linux_candidates() {
             return Some(path);
         }
     }
@@ -3706,7 +3761,31 @@ fn is_official_chatgpt_macos_path(path: &Path) -> bool {
     )
 }
 
-#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+#[cfg(any(test, target_os = "linux"))]
+fn normalized_linux_codex_path_text(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_legacy_codex_linux_launch_path(path: &Path) -> bool {
+    let normalized = normalized_linux_codex_path_text(path);
+    normalized == "/opt/codex-desktop/start.sh"
+        || normalized.ends_with("/bin/codex-desktop")
+        || normalized.ends_with("/codex-desktop/start.sh")
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_official_chatgpt_linux_launch_path(path: &Path) -> bool {
+    let normalized = normalized_linux_codex_path_text(path);
+    normalized.ends_with("/chatgpt/chatgpt")
+        || normalized.ends_with("/chatgpt/codex-launcher")
+        || normalized.ends_with("/bin/chatgpt")
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn should_migrate_legacy_codex_launch_path(current: &Path, detected: &Path) -> bool {
     let mut should_migrate = false;
 
@@ -3722,10 +3801,16 @@ fn should_migrate_legacy_codex_launch_path(current: &Path, detected: &Path) -> b
             && is_official_chatgpt_macos_path(detected);
     }
 
+    #[cfg(any(test, target_os = "linux"))]
+    {
+        should_migrate |= is_legacy_codex_linux_launch_path(current)
+            && is_official_chatgpt_linux_launch_path(detected);
+    }
+
     should_migrate
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn migrate_legacy_codex_launch_path(custom_path: &str) -> Option<std::path::PathBuf> {
     let current_path = std::path::PathBuf::from(custom_path);
     let detected = detect_codex_exec_path()?;
@@ -4206,7 +4291,7 @@ fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
 #[cfg(not(target_os = "macos"))]
 fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
     if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().codex_app_path)) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         if let Some(migrated) = migrate_legacy_codex_launch_path(&custom) {
             return Ok(migrated);
         }
@@ -4220,6 +4305,13 @@ fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
     }
 
     #[cfg(target_os = "windows")]
+    {
+        if let Some(detected) = detect_and_save_codex_launch_path() {
+            return Ok(detected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     {
         if let Some(detected) = detect_and_save_codex_launch_path() {
             return Ok(detected);
@@ -4256,7 +4348,7 @@ fn detect_and_save_app_path_raw(app: &str, force: bool) -> Option<String> {
         }
         "codex" => {
             if !force && !current.codex_app_path.trim().is_empty() {
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 if migrate_legacy_codex_launch_path(&current.codex_app_path).is_some() {
                     return Some(config::get_user_config().codex_app_path);
                 }
@@ -6234,37 +6326,48 @@ pub fn focus_antigravity_legacy_instance(
     Ok(pid)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn codex_unix_process_home_matches(
+    requested_home: Option<&str>,
+    process_home: Option<&str>,
+    default_home: &str,
+) -> bool {
+    let normalized_default = normalize_path_for_compare(default_home);
+    let target = requested_home
+        .map(normalize_path_for_compare)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| normalized_default.clone());
+    let process_home = process_home
+        .map(normalize_path_for_compare)
+        .filter(|value| !value.is_empty());
+
+    match process_home {
+        Some(home) => home == target,
+        None => !normalized_default.is_empty() && target == normalized_default,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn resolve_codex_pid_from_entries(
     last_pid: Option<u32>,
     codex_home: Option<&str>,
     entries: &[(u32, Option<String>)],
 ) -> Option<u32> {
+    let default_home = crate::modules::codex_account::get_codex_home()
+        .to_string_lossy()
+        .to_string();
     let target = codex_home
-        .map(|value| normalize_path_for_compare(value))
-        .filter(|value| !value.is_empty());
+        .map(normalize_path_for_compare)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| normalize_path_for_compare(&default_home));
 
-    let mut matches = Vec::new();
-    for (pid, home) in entries {
-        match (&target, home.as_ref()) {
-            (Some(target_home), Some(home)) => {
-                let normalized = normalize_path_for_compare(home);
-                if !normalized.is_empty() && &normalized == target_home {
-                    matches.push(*pid);
-                }
-            }
-            (None, None) => {
-                matches.push(*pid);
-            }
-            (None, Some(home)) => {
-                let normalized = normalize_path_for_compare(home);
-                if normalized.is_empty() {
-                    matches.push(*pid);
-                }
-            }
-            _ => {}
-        }
-    }
+    let mut matches: Vec<u32> = entries
+        .iter()
+        .filter_map(|(pid, home)| {
+            codex_unix_process_home_matches(codex_home, home.as_deref(), &default_home)
+                .then_some(*pid)
+        })
+        .collect();
 
     // `ps`/`pgrep` may briefly retain zombie entries after a GUI child exits. Never
     // resolve those stale PIDs back into an instance's running state.
@@ -6278,10 +6381,7 @@ pub fn resolve_codex_pid_from_entries(
             crate::modules::logger::log_warn(&format!(
                 "[Codex Resolve] 忽略不匹配的 last_pid={}，target={}，matched_pids={}",
                 pid,
-                target
-                    .as_deref()
-                    .map(|value| summarize_text_for_process_log(value, 96))
-                    .unwrap_or_else(|| "-".to_string()),
+                summarize_text_for_process_log(&target, 96),
                 summarize_pid_list_for_log(&matches)
             ));
         }
@@ -6316,7 +6416,11 @@ pub fn resolve_codex_pid_from_entries(
     pick_preferred_pid(matches)
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+    not(target_os = "linux")
+))]
 pub fn resolve_codex_pid_from_entries(
     last_pid: Option<u32>,
     _codex_home: Option<&str>,
@@ -6325,7 +6429,7 @@ pub fn resolve_codex_pid_from_entries(
     last_pid.filter(|pid| is_pid_running(*pid))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn resolve_codex_pid(last_pid: Option<u32>, codex_home: Option<&str>) -> Option<u32> {
     let entries = collect_codex_process_entries();
     resolve_codex_pid_from_entries(last_pid, codex_home, &entries)
@@ -6337,7 +6441,11 @@ pub fn resolve_codex_pid(last_pid: Option<u32>, codex_home: Option<&str>) -> Opt
     resolve_codex_pid_from_entries(last_pid, codex_home, &entries)
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+    not(target_os = "linux")
+))]
 pub fn resolve_codex_pid(last_pid: Option<u32>, _codex_home: Option<&str>) -> Option<u32> {
     last_pid.filter(|pid| is_pid_running(*pid))
 }
@@ -7203,6 +7311,177 @@ fn collect_named_electron_process_entries_from_proc(app_token: &str) -> Vec<(u32
             entries.push((pid, dir));
         }
     }
+    entries
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_environment_value(pid: u32, key: &str) -> Option<String> {
+    let environment = std::fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    linux_process_environment_value(&environment, key)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_process_environment_value(environment: &[u8], key: &str) -> Option<String> {
+    let prefix = format!("{}=", key);
+    environment.split(|byte| *byte == 0).find_map(|entry| {
+        let value = std::str::from_utf8(entry).ok()?;
+        value
+            .strip_prefix(&prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_codex_process_identity_paths_from(
+    launch_path: &Path,
+    resolved_launch_path: Option<&Path>,
+) -> HashSet<String> {
+    let mut identities = HashSet::new();
+    let mut add_identity = |path: &Path| {
+        let normalized = normalize_path_for_compare(path.to_string_lossy().as_ref());
+        if !normalized.is_empty() {
+            identities.insert(normalized);
+        }
+    };
+
+    add_identity(launch_path);
+    if let Some(resolved) = resolved_launch_path {
+        add_identity(resolved);
+    }
+
+    // Debian's official `/usr/bin/chatgpt` resolves to the shell wrapper
+    // `/usr/lib/chatgpt/codex-launcher`; that wrapper immediately execs the
+    // sibling `ChatGPT` ELF. Include both shapes instead of requiring wrapper-
+    // specific `--app-id`/`--class` arguments that the official package omits.
+    for path in [Some(launch_path), resolved_launch_path]
+        .into_iter()
+        .flatten()
+    {
+        if is_official_chatgpt_linux_launch_path(path) {
+            if let Some(parent) = path.parent() {
+                add_identity(&parent.join("ChatGPT"));
+                add_identity(&parent.join("codex-launcher"));
+            }
+        }
+    }
+
+    // Preserve compatibility with the retired codex-desktop-linux package.
+    if is_legacy_codex_linux_launch_path(launch_path)
+        || resolved_launch_path
+            .map(is_legacy_codex_linux_launch_path)
+            .unwrap_or(false)
+    {
+        add_identity(Path::new("/opt/codex-desktop/electron"));
+        add_identity(Path::new("/opt/codex-desktop/start.sh"));
+    }
+
+    identities
+}
+
+#[cfg(target_os = "linux")]
+fn linux_codex_process_identity_paths(launch_path: &Path) -> HashSet<String> {
+    let resolved = std::fs::canonicalize(launch_path).ok();
+    linux_codex_process_identity_paths_from(launch_path, resolved.as_deref())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_codex_main_process_matches(
+    expected_executables: &HashSet<String>,
+    process_executable: &Path,
+    command_line: &str,
+) -> bool {
+    let command_line_lower = command_line.to_ascii_lowercase();
+    if is_helper_command_line(&command_line_lower)
+        || command_line_lower.contains("crashpad_handler")
+    {
+        return false;
+    }
+    let actual = normalize_path_for_compare(process_executable.to_string_lossy().as_ref());
+    !actual.is_empty() && expected_executables.contains(&actual)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_codex_process_entries_from_proc() -> Vec<(u32, Option<String>)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let launch_path = match resolve_codex_launch_path() {
+        Ok(path) => path,
+        Err(err) => {
+            crate::modules::logger::log_warn(&format!(
+                "[Codex Probe] Linux 启动路径未配置或无效，跳过 PID 匹配: {}",
+                err
+            ));
+            return Vec::new();
+        }
+    };
+    let expected_executables = linux_codex_process_identity_paths(&launch_path);
+    if expected_executables.is_empty() {
+        return Vec::new();
+    }
+
+    let current_uid = std::fs::metadata("/proc/self")
+        .ok()
+        .map(|metadata| metadata.uid());
+    let mut entries = Vec::new();
+    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+        for entry in proc_entries.flatten() {
+            let pid_text = entry.file_name();
+            let pid_text = pid_text.to_string_lossy();
+            if !pid_text.chars().all(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(pid) = pid_text.parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+
+            if let (Some(expected_uid), Ok(metadata)) = (current_uid, entry.metadata()) {
+                if metadata.uid() != expected_uid {
+                    continue;
+                }
+            }
+
+            let Ok(process_executable) = std::fs::read_link(format!("/proc/{}/exe", pid)) else {
+                continue;
+            };
+            let Ok(command_line_bytes) = std::fs::read(format!("/proc/{}/cmdline", pid)) else {
+                continue;
+            };
+            if command_line_bytes.is_empty() {
+                continue;
+            }
+            let command_line = String::from_utf8_lossy(&command_line_bytes).replace('\0', " ");
+            if !linux_codex_main_process_matches(
+                &expected_executables,
+                &process_executable,
+                &command_line,
+            ) {
+                continue;
+            }
+            entries.push((pid, read_linux_process_environment_value(pid, "CODEX_HOME")));
+        }
+    }
+
+    entries.sort_by_key(|(pid, _)| *pid);
+    entries.dedup_by_key(|(pid, _)| *pid);
+    if entries.is_empty() {
+        crate::modules::logger::log_warn(&format!(
+            "[Codex Probe] Linux no main-process match: launch_path={}, expected={:?}",
+            launch_path.to_string_lossy(),
+            expected_executables
+        ));
+    } else {
+        crate::modules::logger::log_info(&format!(
+            "[Codex Probe] Linux matched ChatGPT/Codex main processes: launch_path={}, pids={}",
+            launch_path.to_string_lossy(),
+            summarize_pid_list_for_log(&entries.iter().map(|(pid, _)| *pid).collect::<Vec<_>>())
+        ));
+    }
+
     entries
 }
 
@@ -8310,8 +8589,7 @@ fn launch_trae_macos_with_verification(
 
         let probe_started = Instant::now();
         while probe_started.elapsed() < probe_timeout {
-            if let Some(resolved_pid) =
-                resolve_trae_pid_for_platform(None, user_data_dir, platform)
+            if let Some(resolved_pid) = resolve_trae_pid_for_platform(None, user_data_dir, platform)
             {
                 crate::modules::logger::log_info(&format!(
                     "[Trae Start] platform={} 已匹配主进程 pid={}（{} 后）",
@@ -8366,10 +8644,9 @@ fn launch_trae_macos_with_verification(
                 let probe_started = Instant::now();
                 while probe_started.elapsed() < probe_timeout {
                     if let Some(resolved_pid) =
-                        resolve_trae_pid_for_platform(None, user_data_dir, platform)
-                            .or_else(|| {
-                                resolve_trae_pid_loose_for_platform(None, user_data_dir, platform)
-                            })
+                        resolve_trae_pid_for_platform(None, user_data_dir, platform).or_else(|| {
+                            resolve_trae_pid_loose_for_platform(None, user_data_dir, platform)
+                        })
                     {
                         return Ok(resolved_pid);
                     }
@@ -9874,23 +10151,24 @@ pub fn collect_codex_process_entries() -> Vec<(u32, Option<String>)> {
     collect_codex_process_entries_from_sysinfo_fallback(&expected)
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(target_os = "linux")]
+pub fn collect_codex_process_entries() -> Vec<(u32, Option<String>)> {
+    collect_codex_process_entries_from_proc()
+}
+
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+    not(target_os = "linux")
+))]
 pub fn collect_codex_process_entries() -> Vec<(u32, Option<String>)> {
     Vec::new()
 }
 
-/// 判断 Codex 是否在运行（仅 macOS）
-#[cfg(target_os = "macos")]
+/// 判断 Codex 是否在运行。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn is_codex_running() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        !collect_codex_process_entries().is_empty()
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    !collect_codex_process_entries().is_empty()
 }
 
 /// 启动 Codex（支持 CODEX_HOME 与附加参数，仅 macOS）
@@ -10099,14 +10377,81 @@ pub fn start_codex_with_args(codex_home: &str, extra_args: &[String]) -> Result<
         }
     }
 
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        let codex_home_trimmed = codex_home.trim();
+        if codex_home_trimmed.is_empty() {
+            return Err("实例目录为空，无法启动".to_string());
+        }
+
+        let launch_path = resolve_codex_launch_path()?;
+        let app_user_data_dir = crate::modules::codex_instance::get_linux_app_user_data_dir(
+            Path::new(codex_home_trimmed),
+        )?;
+        std::fs::create_dir_all(&app_user_data_dir).map_err(|e| {
+            format!(
+                "创建 Codex Linux 实例运行目录失败 ({}): {}",
+                app_user_data_dir.to_string_lossy(),
+                e
+            )
+        })?;
+
+        let mut cmd = Command::new(&launch_path);
+        apply_managed_proxy_env_to_command(&mut cmd);
+        cmd.env("CODEX_HOME", codex_home_trimmed);
+        // The retired codex-desktop-linux wrapper reads *_USER_DATA_DIR,
+        // while the current official ChatGPT runtime reads *_USER_DATA_PATH.
+        // Keep both contracts and pass Electron's flag explicitly so every
+        // managed account receives a stable, isolated GUI profile.
+        cmd.env("CODEX_MULTI_LAUNCH", "1");
+        cmd.env("CODEX_ELECTRON_USER_DATA_DIR", &app_user_data_dir);
+        cmd.env("CODEX_ELECTRON_USER_DATA_PATH", &app_user_data_dir);
+        for arg in build_codex_app_launch_args(extra_args) {
+            cmd.arg(arg);
+        }
+        cmd.arg(format!(
+            "--user-data-dir={}",
+            app_user_data_dir.to_string_lossy()
+        ));
+
+        let child = spawn_detached_unix(&mut cmd)
+            .map_err(|e| format!("启动 Codex Linux 实例失败: {}", e))?;
+        crate::modules::logger::log_info(&format!(
+            "[Codex Start] Linux managed instance using ChatGPT/Codex launcher; launch_path={} codex_home={} app_user_data_dir={} pid={}",
+            launch_path.to_string_lossy(),
+            summarize_text_for_process_log(codex_home_trimmed, 96),
+            app_user_data_dir.to_string_lossy(),
+            child.id()
+        ));
+
+        let child_pid = child.id();
+        let probe_started = Instant::now();
+        let timeout = Duration::from_secs(15);
+        while probe_started.elapsed() < timeout {
+            if let Some(resolved_pid) = resolve_codex_pid(None, Some(codex_home_trimmed)) {
+                return Ok(resolved_pid);
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[Codex Start] Linux 实例启动后 15s 内未匹配到实例 PID，回退 launcher pid={}",
+            child_pid
+        ));
+        return Ok(child_pid);
+    }
+
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(target_os = "windows"),
+        not(target_os = "linux")
+    ))]
     {
         let _ = (codex_home, extra_args);
         Err("Codex 应用多开仅支持 macOS 和 Windows".to_string())
     }
 }
 
-/// 启动 Codex 默认实例（不注入 CODEX_HOME，支持附加参数，支持 macOS / Windows）
+/// 启动 Codex 默认实例（Linux 显式注入默认 CODEX_HOME，支持附加参数）。
 pub fn start_codex_default(extra_args: &[String]) -> Result<u32, String> {
     start_codex_default_internal(extra_args, false)
 }
@@ -10320,7 +10665,44 @@ fn start_codex_default_internal(
         return Ok(child.id());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        let launch_path = resolve_codex_launch_path()?;
+        let default_home = crate::modules::codex_account::get_codex_home();
+        let default_home_text = default_home.to_string_lossy().to_string();
+        let mut cmd = Command::new(&launch_path);
+        apply_managed_proxy_env_to_command(&mut cmd);
+        cmd.env("CODEX_HOME", &default_home_text);
+        for arg in build_codex_default_launch_args(extra_args) {
+            cmd.arg(arg);
+        }
+
+        let child = spawn_detached_unix(&mut cmd)
+            .map_err(|e| format!("启动 Codex Linux 默认实例失败: {}", e))?;
+        crate::modules::logger::log_info(&format!(
+            "[Codex Start] Linux default instance using ChatGPT/Codex launcher; launch_path={} codex_home={} pid={}",
+            launch_path.to_string_lossy(),
+            default_home_text,
+            child.id()
+        ));
+
+        let child_pid = child.id();
+        let probe_started = Instant::now();
+        let timeout = Duration::from_secs(15);
+        while probe_started.elapsed() < timeout {
+            if let Some(resolved_pid) = resolve_codex_pid(None, Some(&default_home_text)) {
+                return Ok(resolved_pid);
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[Codex Start] Linux 默认实例启动后 15s 内未匹配到真实 PID，回退 launcher pid={}",
+            child_pid
+        ));
+        return Ok(child_pid);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = extra_args;
         Err("Codex 启动仅支持 macOS 和 Windows".to_string())
@@ -10391,7 +10773,28 @@ pub fn close_codex_default_fast_by_pid(
         Ok(true)
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let Some(pid) = last_pid.filter(|pid| *pid != 0 && is_pid_running(*pid)) else {
+            return Ok(false);
+        };
+        let default_home = crate::modules::codex_account::get_codex_home();
+        let default_home_text = default_home.to_string_lossy().to_string();
+        let Some(resolved_pid) = resolve_codex_pid(Some(pid), Some(&default_home_text)) else {
+            crate::modules::logger::log_warn(&format!(
+                "[Codex Close] fast default close skipped, last_pid={} is not the Linux default instance",
+                pid
+            ));
+            return Ok(false);
+        };
+        if resolved_pid != pid {
+            return Ok(false);
+        }
+        close_pids(&[pid], timeout_secs)?;
+        Ok(!is_pid_running(pid))
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
     {
         let _ = (last_pid, timeout_secs);
         Ok(false)
@@ -10399,7 +10802,7 @@ pub fn close_codex_default_fast_by_pid(
 }
 
 pub fn close_codex_default(timeout_secs: u64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let default_home = crate::modules::codex_account::get_codex_home()
             .to_string_lossy()
@@ -10415,7 +10818,7 @@ pub fn close_codex_default(timeout_secs: u64) -> Result<(), String> {
         return close_codex_instances(&[default_home], timeout_secs);
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = timeout_secs;
         Err("Codex 启动仅支持 macOS 和 Windows".to_string())
@@ -10465,6 +10868,36 @@ fn request_codex_graceful_close(pid: u32) -> bool {
         Err(err) => {
             crate::modules::logger::log_warn(&format!(
                 "[Codex Close] graceful osascript error pid={} err={}",
+                pid, err
+            ));
+            false
+        }
+    }
+}
+
+/// Linux has no portable GUI automation API here; SIGTERM is the normal app shutdown request.
+#[cfg(target_os = "linux")]
+fn request_codex_graceful_close(pid: u32) -> bool {
+    if pid == 0 || !is_pid_running(pid) {
+        return true;
+    }
+
+    match Command::new("kill")
+        .args(["-15", &pid.to_string()])
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            crate::modules::logger::log_warn(&format!(
+                "[Codex Close] Linux SIGTERM failed pid={} err={}",
+                pid,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            false
+        }
+        Err(err) => {
+            crate::modules::logger::log_warn(&format!(
+                "[Codex Close] Linux SIGTERM error pid={} err={}",
                 pid, err
             ));
             false
@@ -10527,7 +10960,7 @@ pub fn restart_codex_default(extra_args: &[String], timeout_secs: u64) -> Result
 
 /// 关闭受管 Codex 实例（按 CODEX_HOME 匹配，包含默认实例目录）
 pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         crate::modules::logger::log_info("正在关闭受管 Codex 实例...");
 
@@ -10592,7 +11025,7 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
             }
         } else {
             crate::modules::logger::log_warn(
-                "[Codex Close] graceful close request failed for all macOS targets, skip grace wait",
+                "[Codex Close] graceful close request failed for all Unix targets, skip grace wait",
             );
         }
         let remaining = collect_running_pids(&pids);
@@ -10764,7 +11197,11 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
         Ok(())
     }
 
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(target_os = "windows"),
+        not(target_os = "linux")
+    ))]
     {
         let _ = (codex_homes, timeout_secs);
         Err("Codex 应用多开仅支持 macOS 和 Windows".to_string())
@@ -12923,11 +13360,7 @@ pub fn start_trae_platform_default_with_args_with_new_window(
         let _ = use_new_window;
 
         return launch_trae_macos_with_verification(
-            platform,
-            &app_root,
-            &args,
-            None,
-            /* prefer_new_instance */ false,
+            platform, &app_root, &args, None, /* prefer_new_instance */ false,
         );
     }
 
@@ -13381,6 +13814,26 @@ mod codex_path_migration_tests {
     }
 
     #[test]
+    fn migrates_legacy_linux_launcher_to_official_chatgpt() {
+        assert!(should_migrate_legacy_codex_launch_path(
+            Path::new("/home/test/.local/bin/codex-desktop"),
+            Path::new("/usr/bin/chatgpt"),
+        ));
+        assert!(should_migrate_legacy_codex_launch_path(
+            Path::new("/opt/codex-desktop/start.sh"),
+            Path::new("/usr/lib/chatgpt/ChatGPT"),
+        ));
+    }
+
+    #[test]
+    fn keeps_custom_linux_launcher_during_chatgpt_detection() {
+        assert!(!should_migrate_legacy_codex_launch_path(
+            Path::new("/home/test/tools/my-codex-launcher"),
+            Path::new("/usr/bin/chatgpt"),
+        ));
+    }
+
+    #[test]
     fn scan_rejects_codex_keyword_helper_executables() {
         let exe_names = HashSet::from(["chatgpt.exe".to_string(), "codex.exe".to_string()]);
         let keywords = vec!["chatgpt".to_string(), "codex".to_string()];
@@ -13408,6 +13861,82 @@ mod codex_path_migration_tests {
         assert!(!is_codex_embedded_backend_executable(Path::new(
             r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0\app\Codex.exe"
         )));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod codex_linux_process_tests {
+    use super::{
+        codex_unix_process_home_matches, linux_codex_main_process_matches,
+        linux_codex_process_identity_paths_from, linux_process_environment_value,
+        normalize_path_for_compare,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn official_chatgpt_wrapper_identity_includes_real_binary() {
+        let identities = linux_codex_process_identity_paths_from(
+            Path::new("/mock/usr/bin/chatgpt"),
+            Some(Path::new("/mock/usr/lib/chatgpt/codex-launcher")),
+        );
+        let real_binary = Path::new("/mock/usr/lib/chatgpt/ChatGPT");
+        assert!(identities.contains(&normalize_path_for_compare(
+            real_binary.to_string_lossy().as_ref()
+        )));
+        assert!(linux_codex_main_process_matches(
+            &identities,
+            real_binary,
+            "/mock/usr/lib/chatgpt/ChatGPT"
+        ));
+    }
+
+    #[test]
+    fn official_chatgpt_match_does_not_require_legacy_flags() {
+        let identities = linux_codex_process_identity_paths_from(
+            Path::new("/mock/usr/bin/chatgpt"),
+            Some(Path::new("/mock/usr/lib/chatgpt/codex-launcher")),
+        );
+        let real_binary = Path::new("/mock/usr/lib/chatgpt/ChatGPT");
+        assert!(linux_codex_main_process_matches(
+            &identities,
+            real_binary,
+            "/mock/usr/lib/chatgpt/ChatGPT"
+        ));
+        assert!(!linux_codex_main_process_matches(
+            &identities,
+            real_binary,
+            "/mock/usr/lib/chatgpt/ChatGPT --type=renderer"
+        ));
+    }
+
+    #[test]
+    fn reads_codex_home_from_proc_environment_bytes() {
+        let environment = b"HOME=/home/test\0CODEX_HOME=/tmp/account-a\0DISPLAY=:0\0";
+        assert_eq!(
+            linux_process_environment_value(environment, "CODEX_HOME").as_deref(),
+            Some("/tmp/account-a")
+        );
+    }
+
+    #[test]
+    fn default_process_accepts_explicit_or_implicit_default_home() {
+        let default_home = "/home/test/.codex";
+        assert!(codex_unix_process_home_matches(None, None, default_home));
+        assert!(codex_unix_process_home_matches(
+            None,
+            Some(default_home),
+            default_home
+        ));
+        assert!(codex_unix_process_home_matches(
+            Some(default_home),
+            None,
+            default_home
+        ));
+        assert!(!codex_unix_process_home_matches(
+            Some("/tmp/account-a"),
+            None,
+            default_home
+        ));
     }
 }
 

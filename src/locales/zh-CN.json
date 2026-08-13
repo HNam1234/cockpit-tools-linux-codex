@@ -1962,7 +1962,7 @@
       "comingSoon": "应用多开功能即将上线",
       "comingSoonDesc": "支持以不同账号同时运行多个 Codex.app 实例，敬请期待。",
       "unsupported": {
-        "desc": "Codex 应用多开仅支持 macOS 和 Windows。",
+        "desc": "Codex 应用多开支持 macOS、Windows 和 Linux。",
         "title": "暂不支持当前系统"
       },
       "quota": {

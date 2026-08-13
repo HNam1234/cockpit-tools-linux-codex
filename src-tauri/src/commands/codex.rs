@@ -877,9 +877,9 @@ pub async fn switch_codex_account(
 
     if user_config.codex_launch_on_switch {
         let launch_started = Instant::now();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if process::is_codex_running() {
-            logger::log_info("检测到 Codex 正在运行，将按默认实例 PID 逻辑重启");
+            logger::log_info("检测到 ChatGPT/Codex 正在运行，将按默认实例 PID 逻辑重启");
         }
         match crate::commands::codex_instance::codex_start_default_with_prepared_profile(
             app.clone(),

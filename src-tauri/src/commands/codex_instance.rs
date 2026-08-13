@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -992,6 +992,49 @@ fn build_macos_codex_terminal_launch_plan(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn build_linux_terminal_args(program: &str, command: &str) -> Vec<String> {
+    let shell_command = format!("{}; exec bash", command);
+    let program_lower = program.to_ascii_lowercase();
+    if program_lower.ends_with("gnome-terminal") {
+        vec![
+            "--".to_string(),
+            "bash".to_string(),
+            "-lc".to_string(),
+            shell_command,
+        ]
+    } else if program_lower.ends_with("kitty") {
+        vec!["bash".to_string(), "-lc".to_string(), shell_command]
+    } else {
+        vec![
+            "-e".to_string(),
+            "bash".to_string(),
+            "-lc".to_string(),
+            shell_command,
+        ]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_codex_terminal_launch_plan(
+    command: &str,
+    terminal: &str,
+) -> CodexTerminalLaunchPlan {
+    let normalized = terminal.trim();
+    let program = if normalized.is_empty() || normalized.eq_ignore_ascii_case("system") {
+        "x-terminal-emulator"
+    } else {
+        normalized
+    };
+    let args = build_linux_terminal_args(program, command);
+    CodexTerminalLaunchPlan {
+        program: program.to_string(),
+        display_command: format_terminal_display_command(program, &args),
+        args,
+        terminal_name: program.to_string(),
+    }
+}
+
 fn build_codex_terminal_launch_plan(
     command: &str,
     terminal: &str,
@@ -1006,7 +1049,12 @@ fn build_codex_terminal_launch_plan(
         return Ok(build_windows_codex_terminal_launch_plan(command, terminal));
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(build_linux_codex_terminal_launch_plan(command, terminal));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         return Ok(CodexTerminalLaunchPlan {
             program: String::new(),
@@ -1017,7 +1065,7 @@ fn build_codex_terminal_launch_plan(
     }
 
     #[allow(unreachable_code)]
-    Err("Codex CLI 终端执行仅支持 macOS 和 Windows".to_string())
+    Err("Codex CLI 终端执行仅支持 macOS、Windows 和 Linux".to_string())
 }
 
 fn resolve_codex_launch_terminal(terminal: Option<String>) -> String {
@@ -2058,6 +2106,40 @@ pub async fn codex_execute_instance_launch_command(
         return Ok(format!("已在 {} 执行 Codex CLI 命令", plan.terminal_name));
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        let is_system_terminal =
+            terminal.trim().is_empty() || terminal.eq_ignore_ascii_case("system");
+        let mut attempts = vec![(plan.program.clone(), plan.args.clone())];
+        if is_system_terminal {
+            for fallback in ["gnome-terminal", "konsole", "xterm"] {
+                if fallback != plan.program {
+                    attempts.push((
+                        fallback.to_string(),
+                        build_linux_terminal_args(fallback, &command),
+                    ));
+                }
+            }
+        }
+
+        let mut last_error = None;
+        for (program, args) in attempts {
+            match Command::new(&program).args(&args).spawn() {
+                Ok(child) => {
+                    drop(child);
+                    return Ok(format!("已在 {} 执行 Codex CLI 命令", program));
+                }
+                Err(error) => {
+                    last_error = Some(format!("{}: {}", program, error));
+                }
+            }
+        }
+        return Err(format!(
+            "打开 Linux 终端失败: {}",
+            last_error.unwrap_or_else(|| format!("无法启动 {}", plan.program))
+        ));
+    }
+
     #[allow(unreachable_code)]
-    Err("Codex CLI 终端执行仅支持 macOS 和 Windows".to_string())
+    Err("Codex CLI 终端执行仅支持 macOS、Windows 和 Linux".to_string())
 }

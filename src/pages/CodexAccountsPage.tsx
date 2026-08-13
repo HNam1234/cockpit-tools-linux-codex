@@ -963,7 +963,8 @@ function resolveApiProviderPresetDefaults(
 export function CodexAccountsPage() {
   const isMacOS = usePlatformRuntimeSupport("macos-only");
   const isWindows = usePlatformRuntimeSupport("windows-only");
-  const isCliLaunchSupported = isMacOS || isWindows;
+  const isLinux = usePlatformRuntimeSupport("linux-only");
+  const isCliLaunchSupported = isMacOS || isWindows || isLinux;
   const sponsorModule = useSponsorStore((state) => state.state.sponsorModule);
   const fetchSponsorState = useSponsorStore((state) => state.fetchState);
   const [activeTab, setActiveTab] = useState<CodexTab>("overview");

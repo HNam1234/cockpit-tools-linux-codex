@@ -70,7 +70,8 @@ export function CodexInstancesContent({
   const accounts = accountsForSelect ?? storeAccounts;
   const isMacOS = usePlatformRuntimeSupport("macos-only");
   const isWindows = usePlatformRuntimeSupport("windows-only");
-  const isSupportedPlatform = isMacOS || isWindows;
+  const isLinux = usePlatformRuntimeSupport("linux-only");
+  const isSupportedPlatform = isMacOS || isWindows || isLinux;
   const [showCodeReviewQuota, setShowCodeReviewQuota] = useState<boolean>(
     isCodexCodeReviewQuotaVisibleByDefault,
   );
@@ -540,7 +541,7 @@ export function CodexInstancesContent({
           unsupportedTitleKey="common.shared.instances.unsupported.title"
           unsupportedTitleDefault="暂不支持当前系统"
           unsupportedDescKey="codex.instances.unsupported.desc"
-          unsupportedDescDefault="Codex 应用多开仅支持 macOS 和 Windows。"
+          unsupportedDescDefault="Codex 应用多开仅支持 macOS、Windows 和 Linux。"
           onInstanceStarted={handleInstanceStarted}
           resolveStartSuccessMessage={(instance) =>
             (instance.launchMode ?? "app") === "cli"

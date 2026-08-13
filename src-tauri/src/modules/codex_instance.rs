@@ -27,6 +27,8 @@ const CODEX_SHARED_COPY_MARKER_FILE_NAME: &str = ".cockpit-tools-shared-copy";
 const CODEX_WINDOWS_APP_DATA_DIR_NAME: &str = "codex-app-data";
 #[cfg(target_os = "macos")]
 const CODEX_MACOS_APP_DATA_DIR_NAME: &str = "codex-app-data";
+#[cfg(target_os = "linux")]
+const CODEX_LINUX_APP_DATA_DIR_NAME: &str = "codex-app-data";
 #[cfg(target_os = "windows")]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
@@ -275,6 +277,29 @@ pub fn get_macos_app_user_data_dir(codex_home: &Path) -> Result<PathBuf, String>
         .ok_or("无法获取 Codex 实例根目录")?
         .join(CODEX_MACOS_APP_DATA_DIR_NAME);
     let normalized = normalize_macos_codex_home_for_hash(codex_home);
+    let digest = format!("{:x}", md5::compute(normalized.as_bytes()));
+    Ok(root.join(digest))
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_codex_home_for_hash(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved.to_string_lossy().to_string()
+}
+
+/// Resolve the isolated Electron user-data directory used by the Linux Codex wrapper.
+///
+/// The Linux launcher keeps Codex credentials under `CODEX_HOME`, but Electron's
+/// profile must also be isolated for each managed instance. Keep that profile
+/// inside Cockpit's managed data directory and derive a stable name from the
+/// instance's Codex home.
+#[cfg(target_os = "linux")]
+pub fn get_linux_app_user_data_dir(codex_home: &Path) -> Result<PathBuf, String> {
+    let root = get_default_instances_root_dir()?
+        .parent()
+        .ok_or("无法获取 Codex 实例根目录")?
+        .join(CODEX_LINUX_APP_DATA_DIR_NAME);
+    let normalized = normalize_linux_codex_home_for_hash(codex_home);
     let digest = format!("{:x}", md5::compute(normalized.as_bytes()));
     Ok(root.join(digest))
 }
